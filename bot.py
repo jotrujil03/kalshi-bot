@@ -1,181 +1,321 @@
 """
-Core bot orchestrator for Kalshi 15-minute BTC trading.
-
-Flow (runs every ~1 minute):
-  1. Discover the open BTC 15-min market whose close is 3-13 min away.
-  2. Fetch BTC 1-min candles and generate a directional signal.
-  3. If signal confidence >= MIN_CONFIDENCE, size and place a limit order.
-  4. Log position after fill or timeout.
+bot.py - Spot-gated directional scalper.
+Entry only on BTC spot velocity. One side. Exit on TP or spot reversal.
 """
-
 import logging
+import threading
 import time
-from datetime import datetime, timezone, timedelta
-from typing import Optional
+from datetime import datetime, timezone
 
-import btc_data
-import config
 import strategy
-from kalshi_client import KalshiClient, KalshiAPIError
-from strategy import Direction
+import fair_value
+from btc_data import current_price
+
+try:
+    import config
+    from kalshi_client import KalshiClient
+    LIVE_IMPORTS_SUCCESS = True
+except ImportError:
+    LIVE_IMPORTS_SUCCESS = False
 
 logger = logging.getLogger(__name__)
 
 
-def _parse_close_time(market: dict) -> Optional[datetime]:
-    raw = market.get("close_time") or market.get("expiration_time")
-    if not raw:
-        return None
-    try:
-        # Kalshi returns ISO-8601 strings like "2024-01-01T15:00:00Z"
-        return datetime.fromisoformat(raw.replace("Z", "+00:00"))
-    except ValueError:
-        return None
+class MarketMakerBot:
+    def __init__(self, client=None, api_lock=None):
+        self.ticker = None
+        self.close_dt = None
+        self.is_dry_run = getattr(config, "DRY_RUN", True) if LIVE_IMPORTS_SUCCESS else True
+        self.api_lock = api_lock or threading.Lock()
 
-
-def find_btc_15min_market(client: KalshiClient) -> Optional[dict]:
-    """Return the most suitable open BTC 15-min market, or None."""
-    now = datetime.now(timezone.utc)
-    best: Optional[dict] = None
-    best_minutes: float = float("inf")
-
-    for series in config.BTC_SERIES_TICKERS:
-        try:
-            markets = client.get_markets(series_ticker=series, status="open", limit=50)
-        except KalshiAPIError as exc:
-            logger.debug("Series %s lookup failed: %s", series, exc)
-            continue
-        except Exception as exc:
-            logger.warning("Unexpected error fetching series %s: %s", series, exc)
-            continue
-
-        for m in markets:
-            close_dt = _parse_close_time(m)
-            if close_dt is None:
-                continue
-            minutes_left = (close_dt - now).total_seconds() / 60
-            if config.MIN_MINUTES_TO_CLOSE <= minutes_left <= config.MAX_MINUTES_TO_CLOSE:
-                if minutes_left < best_minutes:
-                    best_minutes = minutes_left
-                    best = m
-
-    if best:
-        logger.info(
-            "Found BTC market: %s — closes in %.1f min (title: %s)",
-            best.get("ticker"), best_minutes, best.get("title", "")[:80],
-        )
-    else:
-        logger.debug("No suitable BTC 15-min market found right now.")
-    return best
-
-
-def _yes_price_from_orderbook(client: KalshiClient, ticker: str, side: str) -> Optional[int]:
-    """Return a competitive limit price in cents for the given side."""
-    try:
-        ob = client.get_orderbook(ticker, depth=3)
-        if side == "yes":
-            asks = ob.get("orderbook", {}).get("yes", [])
-            if asks:
-                return asks[0][0]   # best ask price in cents
+        if client is not None:
+            self.client = client
+        elif LIVE_IMPORTS_SUCCESS and not self.is_dry_run:
+            self.client = KalshiClient(
+                api_key_id=config.KALSHI_API_KEY_ID,
+                private_key_path=config.KALSHI_PRIVATE_KEY_PATH,
+                base_url=config.BASE_URL,
+            )
         else:
-            bids = ob.get("orderbook", {}).get("no", [])
-            if bids:
-                return bids[0][0]
-    except Exception as exc:
-        logger.warning("Could not fetch orderbook for %s: %s", ticker, exc)
-    return None
+            self.client = None
 
+        self.net_yes_inventory = 0.0
+        self.MAX_INVENTORY = 1
 
-def _calc_contracts(yes_price_cents: int, max_usd: float, max_contracts: int) -> int:
-    """How many contracts to buy given a price and USD cap."""
-    if yes_price_cents <= 0:
-        return 0
-    cost_per = yes_price_cents / 100.0
-    affordable = int(max_usd / cost_per)
-    return max(1, min(affordable, max_contracts))
+        # Single active entry (one side at a time)
+        self.active_yes_bid = 0
+        self.active_no_bid = 0
+        self.yes_order_id = None
+        self.no_order_id = None
+        self.entry_order_time = 0
 
+        # Exit
+        self.active_yes_ask = 0
+        self.active_no_ask = 0
+        self.yes_exit_order_id = None
+        self.no_exit_order_id = None
+        self.exit_order_time = 0
 
-class TradingBot:
-    def __init__(self):
-        self.client = KalshiClient(
-            api_key_id=config.KALSHI_API_KEY_ID,
-            private_key_path=config.KALSHI_PRIVATE_KEY_PATH,
-            base_url=config.BASE_URL,
-        )
-        self.active_ticker: Optional[str] = None   # avoid double-entering same market
+        self.yes_entry_price = 0
+        self.no_entry_price = 0
+        self.last_stop_time = 0
 
-    def run_cycle(self):
-        """Execute one decision cycle. Called by the scheduler every minute."""
-        logger.info("=== Cycle start ===")
+        # Spot injected by spot thread
+        self.spot_vel = 0.0
+        self.spot_price = 0.0
+        self._spot_lock = threading.Lock()
+        self.strike = 0.0
 
-        market = find_btc_15min_market(self.client)
-        if market is None:
-            return
+        self.last_inventory_sync = 0
 
-        ticker = market.get("ticker")
-        if ticker == self.active_ticker:
-            logger.info("Already entered %s this window — skipping.", ticker)
-            return
+    def set_spot(self, price: float, vel: float):
+        with self._spot_lock:
+            self.spot_price = price
+            self.spot_vel = vel
 
-        # Fetch BTC candles and generate signal
-        try:
-            df = btc_data.fetch_ohlcv(interval="1m", limit=60)
-        except Exception as exc:
-            logger.error("BTC data fetch failed: %s", exc)
-            return
+    def get_spot(self):
+        with self._spot_lock:
+            return self.spot_price, self.spot_vel
 
-        sig = strategy.generate_signal(df)
-
-        if sig.direction == Direction.NEUTRAL or sig.confidence < config.MIN_CONFIDENCE:
-            logger.info(
-                "Signal too weak (%s, conf=%.2f) — no trade.", sig.direction.value, sig.confidence
-            )
-            return
-
-        # Determine Kalshi side
-        # "yes" = BTC will be above strike; "no" = BTC will be at or below strike
-        side = "yes" if sig.direction == Direction.BULLISH else "no"
-
-        yes_price = _yes_price_from_orderbook(self.client, ticker, side)
-        if yes_price is None:
-            # Fall back to a conservative mid-market guess
-            yes_price = 55 if side == "yes" else 45
-            logger.warning("Orderbook unavailable — using fallback price %d¢", yes_price)
-
-        no_price = 100 - yes_price
-        price_cents = yes_price if side == "yes" else no_price
-        contracts = _calc_contracts(price_cents, config.MAX_TRADE_USD, config.MAX_POSITION_SIZE)
-
-        logger.info(
-            "Placing %s %s x%d @ %d¢ | BTC=%.2f | conf=%.2f",
-            side.upper(), ticker, contracts, price_cents, sig.price, sig.confidence,
-        )
-
-        try:
-            order = self.client.place_order(
-                ticker=ticker,
-                side=side,
-                action="buy",
-                count=contracts,
-                order_type="limit",
-                yes_price=yes_price if side == "yes" else None,
-                no_price=no_price if side == "no" else None,
-            )
-            logger.info("Order placed: %s", order)
-            self.active_ticker = ticker
-        except KalshiAPIError as exc:
-            logger.error("Order failed: %s", exc)
-        except Exception as exc:
-            logger.exception("Unexpected error placing order: %s", exc)
-
-    def reset_active_ticker_if_expired(self):
-        """Clear the active ticker guard when the market it refers to is no longer open."""
-        if self.active_ticker is None:
+    # ── Order helpers ─────────────────────────────────────────────────────────
+    def _cancel_order(self, order_id: str):
+        if not order_id or self.is_dry_run:
             return
         try:
-            m = self.client.get_market(self.active_ticker)
-            if m.get("status") != "open":
-                logger.info("Market %s closed — resetting active ticker.", self.active_ticker)
-                self.active_ticker = None
-        except Exception:
-            self.active_ticker = None
+            with self.api_lock:
+                self.client.cancel_order(order_id)
+        except Exception as e:
+            if "not_found" not in str(e).lower():
+                logger.debug(f"Cancel note: {e}")
+
+    def _sync_inventory(self):
+        if self.is_dry_run or not self.client or time.time() - self.last_inventory_sync < 5:
+            return
+        try:
+            with self.api_lock:
+                positions = self.client.get_positions(self.ticker)
+            self.net_yes_inventory = 0.0
+            for pos in positions:
+                if pos.get("ticker") == self.ticker:
+                    raw = pos.get("yes_position", 0) or pos.get("position", 0)
+                    self.net_yes_inventory = float(raw)
+            self.last_inventory_sync = time.time()
+        except:
+            pass
+
+    def _is_good_orderbook(self, orderbook: dict) -> bool:
+        yes = orderbook.get("yes", [])
+        no = orderbook.get("no", [])
+        total = sum(q for _, q in yes) + sum(q for _, q in no)
+        return len(yes) > 5 and len(no) > 5 and total >= 50
+
+    def _place_live_order(self, action: str, side: str, price: int) -> str:
+        if self.is_dry_run:
+            logger.info(f"[DRY_RUN] Would {action.upper()} {side.upper()} x1 @ {price}¢")
+            return "DRY"
+        try:
+            with self.api_lock:
+                resp = self.client.place_order(
+                    ticker=self.ticker, side=side, action=action, count=1,
+                    yes_price=price if side == "yes" else None,
+                    no_price=price if side == "no" else None,
+                )
+            order_id = resp.get("order_id") or resp.get("order", {}).get("id") or "unknown"
+            logger.info(f"Placed {action} {side} @ {price}¢ (ID: {order_id})")
+            return order_id
+        except Exception as e:
+            logger.error(f"Place failed: {e}")
+            return None
+
+    # ── Main tick ─────────────────────────────────────────────────────────────
+    def process_market_tick(self, ticker: str, orderbook: dict, close_time: datetime):
+        self.ticker = ticker
+        self.close_dt = close_time
+        self._sync_inventory()
+
+        minutes_left = (close_time - datetime.now(timezone.utc)).total_seconds() / 60.0
+        if minutes_left <= getattr(config, "EXIT_BEFORE_CLOSE_MIN", 2) and self.net_yes_inventory != 0:
+            self._flatten_inventory(orderbook, "Expiration")
+            return
+
+        if not self._is_good_orderbook(orderbook):
+            self._cancel_all_entries()
+            return
+
+        self._manage(orderbook)
+
+    def _cancel_all_entries(self):
+        self._cancel_order(self.yes_order_id); self.yes_order_id = None
+        self._cancel_order(self.no_order_id);  self.no_order_id = None
+        self.active_yes_bid = self.active_no_bid = 0
+
+    # ── Strategy core ─────────────────────────────────────────────────────────
+    def _manage(self, orderbook: dict):
+        _, spot_vel = self.get_spot()
+        stopband = getattr(config, "SPOT_STOP", 0.5)        # $/sec reversal to exit
+
+        # TP scaled to clear round-trip fees
+        tp_cents = getattr(config, "TAKE_PROFIT_CENTS", 3)
+        entry_px = self.yes_entry_price if self.net_yes_inventory > 0 else self.no_entry_price
+        if entry_px:
+            fee = strategy.kalshi_fee_cents(entry_px)
+            tp_cents = max(tp_cents, 2 * fee + 1)
+
+        # ----- FLAT: clean exit state, then consider entry -----
+        if self.net_yes_inventory == 0:
+            self._clear_exit_state()
+
+            if time.time() - self.last_stop_time < getattr(config, "REENTRY_COOLDOWN", 5):
+                self._cancel_all_entries()
+                return
+
+            plan = strategy.generate_quotes(orderbook, self.net_yes_inventory, self.MAX_INVENTORY)
+            if plan.get("status") != "active":
+                self._cancel_all_entries()
+                return
+
+            sig = self._fair_value_signal(orderbook)
+            if sig is None:
+                self._cancel_all_entries()
+                return
+            if sig == "yes":
+                self._quote_entry("yes", plan["quotes"]["yes_bid"], spot_vel)
+                self._cancel_side("no")
+            else:
+                self._quote_entry("no", plan["quotes"]["no_bid"], spot_vel)
+                self._cancel_side("yes")
+            return
+
+        # ----- LONG YES -----
+        if self.net_yes_inventory > 0:
+            if self.yes_entry_price == 0:
+                self.yes_entry_price = self.active_yes_bid
+                logger.info(f"YES fill. Entry {self.yes_entry_price}¢")
+            if spot_vel < -stopband:
+                logger.info(f"SPOT STOP: {spot_vel:.2f}$/s, dumping YES")
+                self.last_stop_time = time.time()
+                self._flatten_inventory(orderbook, "SpotStop")
+                return
+            self._manage_exit("yes", self.yes_entry_price, tp_cents, orderbook)
+            return
+
+        # ----- LONG NO -----
+        if self.net_yes_inventory < 0:
+            if self.no_entry_price == 0:
+                self.no_entry_price = self.active_no_bid
+                logger.info(f"NO fill. Entry {self.no_entry_price}¢")
+            if spot_vel > stopband:
+                logger.info(f"SPOT STOP: {spot_vel:.2f}$/s, dumping NO")
+                self.last_stop_time = time.time()
+                self._flatten_inventory(orderbook, "SpotStop")
+                return
+            self._manage_exit("no", self.no_entry_price, tp_cents, orderbook)
+            return
+
+    def _implied_yes(self, orderbook: dict):
+        yes = orderbook.get("yes", [])
+        no = orderbook.get("no", [])
+        if not yes or not no:
+            return None
+        best_yes = max(p for p, _ in yes)
+        best_no = max(p for p, _ in no)
+        implied_yes_ask = 100 - best_no
+        return (best_yes + implied_yes_ask) / 200.0  # [0,1]
+
+    def _fair_value_signal(self, orderbook: dict):
+        spot, _ = self.get_spot()
+        if spot <= 0 or self.strike <= 0 or not self.close_dt:
+            return None
+        secs_left = (self.close_dt - datetime.now(timezone.utc)).total_seconds()
+        if secs_left <= getattr(config, "MIN_SECS_LEFT", 60):
+            return None
+        implied = self._implied_yes(orderbook)
+        if implied is None:
+            return None
+        # round-trip fee at the implied price (cents)
+        fee_rt = 2 * strategy.kalshi_fee_cents(implied * 100)
+        e = fair_value.edge(spot, self.strike, secs_left, implied, fee_rt)
+        logger.info(f"FV: spot={spot:.0f} K={self.strike:.0f} fair={e['fair_yes']:.3f} impl={implied:.3f} div={e['divergence']:+.3f} thr={e['threshold']:.3f}")
+        if e["signal"]:
+            logger.info(f"EDGE {e['signal'].upper()}: fair={e['fair_yes']:.3f} "
+                        f"impl={implied:.3f} div={e['divergence']:+.3f} thr={e['threshold']:.3f} "
+                        f"sig={self.spot_vel:+.2f}$/s")
+        return e["signal"]
+
+    def _quote_entry(self, side: str, price: int, spot_vel: float):
+        if price <= 0:
+            return
+        active = self.active_yes_bid if side == "yes" else self.active_no_bid
+        oid = self.yes_order_id if side == "yes" else self.no_order_id
+        requote = getattr(config, "REQUOTE_DRIFT_CENTS", 1)
+        max_q = getattr(config, "MAX_QUOTE_SECONDS", 30)
+        drift = abs(price - active) if active else 999
+        stale = self.entry_order_time and time.time() - self.entry_order_time > max_q
+        if drift < requote and not stale:
+            return
+        self._cancel_order(oid)
+        new_id = None
+        logger.info(f"ENTRY {side.upper()} {price}¢ | SpotVel {spot_vel:.2f}$/s")
+        new_id = self._place_live_order("buy", side, price)
+        self.entry_order_time = time.time()
+        if side == "yes":
+            self.yes_order_id = new_id; self.active_yes_bid = price
+        else:
+            self.no_order_id = new_id; self.active_no_bid = price
+
+    def _cancel_side(self, side: str):
+        if side == "yes":
+            if self.yes_order_id or self.active_yes_bid:
+                self._cancel_order(self.yes_order_id)
+                self.yes_order_id = None; self.active_yes_bid = 0
+        else:
+            if self.no_order_id or self.active_no_bid:
+                self._cancel_order(self.no_order_id)
+                self.no_order_id = None; self.active_no_bid = 0
+
+    def _manage_exit(self, side: str, entry: int, tp_cents: int, orderbook: dict):
+        ask_price = int(entry + tp_cents)
+        timeout = getattr(config, "MAX_QUOTE_SECONDS", 30)
+        active = self.active_yes_ask if side == "yes" else self.active_no_ask
+        oid = self.yes_exit_order_id if side == "yes" else self.no_exit_order_id
+        if self.exit_order_time and time.time() - self.exit_order_time > timeout:
+            best_bid = max((p for p, _ in orderbook.get(side, [])), default=ask_price)
+            ask_price = min(ask_price, best_bid)   # cross to fill
+        if active == ask_price:
+            return
+        self._cancel_order(oid)
+        logger.info(f"EXIT SELL {side.upper()} @ {ask_price}¢ (Entry {entry}¢)")
+        new_id = self._place_live_order("sell", side, ask_price)
+        self.exit_order_time = time.time()
+        if side == "yes":
+            self.yes_exit_order_id = new_id; self.active_yes_ask = ask_price
+        else:
+            self.no_exit_order_id = new_id; self.active_no_ask = ask_price
+
+    def _clear_exit_state(self):
+        if self.active_yes_ask or self.yes_exit_order_id:
+            self._cancel_order(self.yes_exit_order_id)
+            self.yes_exit_order_id = None; self.active_yes_ask = 0; self.yes_entry_price = 0
+        if self.active_no_ask or self.no_exit_order_id:
+            self._cancel_order(self.no_exit_order_id)
+            self.no_exit_order_id = None; self.active_no_ask = 0; self.no_entry_price = 0
+        self.exit_order_time = 0
+
+    def _flatten_inventory(self, orderbook: dict, reason: str):
+        self._cancel_order(self.yes_order_id); self.yes_order_id = None
+        self._cancel_order(self.no_order_id);  self.no_order_id = None
+        self._cancel_order(self.yes_exit_order_id); self.yes_exit_order_id = None
+        self._cancel_order(self.no_exit_order_id);  self.no_exit_order_id = None
+        self.active_yes_bid = self.active_no_bid = 0
+        self.active_yes_ask = self.active_no_ask = 0
+        self.yes_entry_price = self.no_entry_price = 0
+        self.exit_order_time = 0
+
+        if self.net_yes_inventory > 0:
+            best = max((p for p, _ in orderbook.get("yes", [])), default=1)
+            self._place_live_order("sell", "yes", best)
+        elif self.net_yes_inventory < 0:
+            best = max((p for p, _ in orderbook.get("no", [])), default=1)
+            self._place_live_order("sell", "no", best)
+        self.net_yes_inventory = 0
+        logger.info(f"FLATTENED ({reason})")

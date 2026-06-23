@@ -1,5 +1,4 @@
 import base64
-import json
 import logging
 import time
 from typing import Optional
@@ -32,7 +31,20 @@ class KalshiClient:
         logger.info("Kalshi client initialized (env: %s)", base_url)
 
     def _sign(self, timestamp_ms: str, method: str, path: str) -> str:
-        message = timestamp_ms + method.upper() + path
+        """Critical: Kalshi requires full path including /trade-api/v2 prefix for signing"""
+        # Clean path
+        if '?' in path:
+            path = path.split('?')[0]
+        if not path.startswith('/'):
+            path = '/' + path
+
+        # Full signing path (this fixes INCORRECT_API_KEY_SIGNATURE)
+        full_sign_path = "/trade-api/v2" + path if not path.startswith("/trade-api/v2") else path
+
+        message = timestamp_ms + method.upper() + full_sign_path
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(f"Signing message: {message}")
+
         signature = self.private_key.sign(
             message.encode("utf-8"),
             padding.PSS(
@@ -45,9 +57,10 @@ class KalshiClient:
 
     def _auth_headers(self, method: str, path: str) -> dict:
         ts = str(int(time.time() * 1000))
+        signature = self._sign(ts, method, path)
         return {
             "KALSHI-ACCESS-KEY": self.api_key_id,
-            "KALSHI-ACCESS-SIGNATURE": self._sign(ts, method, path),
+            "KALSHI-ACCESS-SIGNATURE": signature,
             "KALSHI-ACCESS-TIMESTAMP": ts,
         }
 
@@ -63,14 +76,20 @@ class KalshiClient:
                 json=body,
                 timeout=10,
             )
+            if not resp.ok:
+                if method == "DELETE" and resp.status_code == 404:
+                    logger.debug(f"Order already gone on DELETE {path}")
+                else:
+                    logger.error(f"Kalshi error {resp.status_code} on {method} {path}: {resp.text}")
+                raise KalshiAPIError(resp.status_code, resp.text)
+
+            # FIX: Ensure we never return None if the API responds with `null`
+            parsed = resp.json() if resp.text else {}
+            return parsed if isinstance(parsed, dict) else {}
+
         except requests.RequestException as exc:
-            logger.error("Network error calling %s %s: %s", method, path, exc)
+            logger.error(f"Network error on {method} {path}: {exc}")
             raise
-
-        if not resp.ok:
-            raise KalshiAPIError(resp.status_code, resp.text)
-
-        return resp.json() if resp.text else {}
 
     # ── Market discovery ──────────────────────────────────────────────────────
 
@@ -84,8 +103,35 @@ class KalshiClient:
     def get_market(self, ticker: str) -> dict:
         return self._request("GET", f"/markets/{ticker}")
 
-    def get_orderbook(self, ticker: str, depth: int = 5) -> dict:
-        return self._request("GET", f"/markets/{ticker}/orderbook", params={"depth": depth})
+    def get_orderbook(self, ticker: str, depth: int = 10) -> dict:
+        """Returns normalized orderbook with yes/no bids in cents."""
+        data = self._request("GET", f"/markets/{ticker}/orderbook", params={"depth": depth})
+
+        # Safely fallback to {} if the API returns null for the orderbook
+        ob_fp = data.get("orderbook_fp") or data.get("orderbook") or {}
+        if not isinstance(ob_fp, dict):
+            ob_fp = {}
+
+        yes_raw = ob_fp.get("yes_dollars", []) or ob_fp.get("yes", [])
+        no_raw = ob_fp.get("no_dollars", []) or ob_fp.get("no", [])
+
+        yes_bids = []
+        for price_str, qty_str in yes_raw:
+            price_cents = int(float(price_str) * 100)
+            qty = int(float(qty_str))
+            yes_bids.append((price_cents, qty))
+
+        no_bids = []
+        for price_str, qty_str in no_raw:
+            price_cents = int(float(price_str) * 100)
+            qty = int(float(qty_str))
+            no_bids.append((price_cents, qty))
+
+        yes_bids.sort(reverse=True)
+        no_bids.sort(reverse=True)
+
+        logger.debug(f"Orderbook for {ticker}: {len(yes_bids)} YES | {len(no_bids)} NO")
+        return {"yes": yes_bids, "no": no_bids}
 
     def get_series(self, series_ticker: str) -> dict:
         return self._request("GET", f"/series/{series_ticker}")
@@ -95,34 +141,50 @@ class KalshiClient:
     def place_order(
         self,
         ticker: str,
-        side: str,          # "yes" or "no"
-        action: str,        # "buy" or "sell"
+        side: str,
+        action: str,
         count: int,
         order_type: str = "limit",
-        yes_price: Optional[int] = None,   # cents (1-99)
+        yes_price: Optional[int] = None,
         no_price: Optional[int] = None,
     ) -> dict:
+        # Map (side, action) -> YES-leg bid/ask + YES price in cents
+        if side == "yes":
+            price_cents = yes_price
+            if price_cents is None:
+                raise ValueError("yes_price required")
+            book_side = "bid" if action == "buy" else "ask"
+            yes_price_cents = price_cents
+        elif side == "no":
+            price_cents = no_price
+            if price_cents is None:
+                raise ValueError("no_price required")
+            # buy NO == sell YES @ (100-n); sell NO == buy YES @ (100-n)
+            book_side = "ask" if action == "buy" else "bid"
+            yes_price_cents = 100 - price_cents
+        else:
+            raise ValueError(f"Invalid side: {side}")
+
+        if not (1 <= yes_price_cents <= 99):
+            raise ValueError(f"Price out of range: {yes_price_cents}¢")
+
         body = {
             "ticker": ticker,
-            "side": side,
-            "action": action,
-            "count": count,
-            "type": order_type,
             "client_order_id": f"bot_{int(time.time() * 1000)}",
+            "side": book_side,
+            "count": str(int(count)),
+            "price": f"{yes_price_cents / 100:.2f}",
+            "time_in_force": "good_till_canceled",
+            "self_trade_prevention_type": "taker_at_cross",
         }
-        if yes_price is not None:
-            body["yes_price"] = yes_price
-        if no_price is not None:
-            body["no_price"] = no_price
 
-        logger.info(
-            "Placing order: %s %s %s x%d @ yes=%s no=%s",
-            action, side, ticker, count, yes_price, no_price,
-        )
-        return self._request("POST", "/orders", body=body)
+        logger.info(f"Placing V2 order: {action} {side} {ticker} x{count} @ {price_cents}¢ "
+                    f"(YES {book_side} @ {yes_price_cents}¢)")
+        return self._request("POST", "/portfolio/events/orders", body=body)
 
     def cancel_order(self, order_id: str) -> dict:
-        return self._request("DELETE", f"/orders/{order_id}")
+        # Changed endpoint to /portfolio/orders/{order_id}
+        return self._request("DELETE", f"/portfolio/orders/{order_id}")
 
     def get_orders(self, ticker: str = None, status: str = None) -> list[dict]:
         params = {}
@@ -130,7 +192,7 @@ class KalshiClient:
             params["ticker"] = ticker
         if status:
             params["status"] = status
-        data = self._request("GET", "/orders", params=params)
+        data = self._request("GET", "/portfolio/orders", params=params)
         return data.get("orders", [])
 
     # ── Portfolio ─────────────────────────────────────────────────────────────
@@ -143,4 +205,4 @@ class KalshiClient:
         if ticker:
             params["ticker"] = ticker
         data = self._request("GET", "/portfolio/positions", params=params)
-        return data.get("market_positions", [])
+        return data.get("market_positions", []) or data.get("positions", [])
